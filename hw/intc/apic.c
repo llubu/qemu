@@ -39,6 +39,8 @@
 
 static APICCommonState *local_apics[MAX_APICS + 1];
 
+#define DEBUG_APIC 1
+
 #define TYPE_APIC "apic"
 #define APIC(obj) \
     OBJECT_CHECK(APICCommonState, (obj), TYPE_APIC)
@@ -477,6 +479,12 @@ static void apic_get_delivery_bitmask(uint32_t *deliver_bitmask,
 
 static void apic_startup(APICCommonState *s, int vector_num)
 {
+#ifdef DEBUG_APIC
+	fprintf(s->log, "apicIdx= %d apicId= %d:: %s-- %d APIC_DM_SIPI RCV "
+		"vector= 0x%x\n", s->initial_apic_id,
+		s->id, __FUNCTION__, __LINE__, vector_num);
+	fflush(s->log);
+#endif
     s->sipi_vector = vector_num;
     cpu_interrupt(CPU(s->cpu), CPU_INTERRUPT_SIPI);
 }
@@ -522,6 +530,23 @@ static void apic_deliver(DeviceState *dev, uint8_t dest, uint8_t dest_mode,
     switch (delivery_mode) {
         case APIC_DM_INIT:
             {
+#ifdef DEBUG_APIC
+	fprintf(s->log, "apicIdx= %d apicId= %d:: %s-- %d APIC_DM_INIT "
+		"dbm[0]= 0x%x dbm[1]= 0x%x dbm[2]= 0x%x dbm[3]= 0x%x "
+		"dbm[4]= 0x%x dbm[5]= 0x%x dbm[6]= 0x%x dbm[7]= 0x%x "
+		"icrLow= 0x%x icrHigh= 0x%x\n",
+		s->initial_apic_id, s->id, __FUNCTION__, __LINE__,
+		deliver_bitmask[0],
+		deliver_bitmask[1],
+		deliver_bitmask[2],
+		deliver_bitmask[3],
+		deliver_bitmask[4],
+		deliver_bitmask[5],
+		deliver_bitmask[6],
+		deliver_bitmask[7], s->icr[0], s->icr[1]
+		);
+	fflush(s->log);
+#endif
                 int trig_mode = (s->icr[0] >> 15) & 1;
                 int level = (s->icr[0] >> 14) & 1;
                 if (level == 0 && trig_mode == 1) {
@@ -533,6 +558,24 @@ static void apic_deliver(DeviceState *dev, uint8_t dest, uint8_t dest_mode,
             break;
 
         case APIC_DM_SIPI:
+#ifdef DEBUG_APIC
+	fprintf(s->log, "apicIdx= %d apicId= %d:: %s-- %d APIC_DM_SIPI"
+		"vector= 0x%x dbm[0]= 0x%x dbm[1]= 0x%x dbm[2]= 0x%x dbm[3]= 0x%x "
+		"dbm[4]= 0x%x dbm[5]= 0x%x dbm[6]= 0x%x dbm[7]= 0x%x "
+		"icrLow= 0x%x icrHigh= 0x%x\n",
+		s->initial_apic_id, s->id, __FUNCTION__, __LINE__,
+		vector_num,
+		deliver_bitmask[0],
+		deliver_bitmask[1],
+		deliver_bitmask[2],
+		deliver_bitmask[3],
+		deliver_bitmask[4],
+		deliver_bitmask[5],
+		deliver_bitmask[6],
+		deliver_bitmask[7], s->icr[0], s->icr[1]
+		);
+	fflush(s->log);
+#endif
             foreach_apic(apic_iter, deliver_bitmask,
                          apic_startup(apic_iter, vector_num) );
             return;
@@ -583,6 +626,12 @@ int apic_get_interrupt(DeviceState *dev)
 
     apic_update_irq(s);
 
+#ifdef DEBUG_APIC
+	fprintf(s->log, "apicIdx= %d apicId= %d:: %s-- %d apicInt= 0x%x\n",
+		s->initial_apic_id, s->id, __FUNCTION__, __LINE__, intno);
+	fflush(s->log);
+#endif
+
     return intno;
 }
 
@@ -601,6 +650,17 @@ int apic_accept_pic_intr(DeviceState *dev)
         return 1;
 
     return 0;
+}
+
+void apic_log_pic_intr(DeviceState *dev, int intnum)
+{
+    APICCommonState *s = APIC(dev);
+
+#ifdef DEBUG_APIC
+	fprintf(s->log, "apicIdx= %d apicId= %d:: %s-- %d picInt= 0x%x\n",
+		s->initial_apic_id, s->id, __FUNCTION__, __LINE__, intnum);
+	fflush(s->log);
+#endif
 }
 
 static uint32_t apic_get_current_count(APICCommonState *s)
@@ -877,6 +937,7 @@ static const MemoryRegionOps apic_io_ops = {
 
 static void apic_realize(DeviceState *dev, Error **errp)
 {
+    char fileName[256];
     APICCommonState *s = APIC(dev);
 
     if (s->id >= MAX_APICS) {
@@ -890,6 +951,12 @@ static void apic_realize(DeviceState *dev, Error **errp)
 
     s->timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, apic_timer, s);
     local_apics[s->id] = s;
+
+    snprintf(fileName, sizeof(fileName), "apic-idx_%d-id_%d.log",
+	s->initial_apic_id, s->id);
+#ifdef DEBUG_APIC
+    s->log = fopen(fileName, "w+");
+#endif
 
     msi_nonbroken = true;
 }

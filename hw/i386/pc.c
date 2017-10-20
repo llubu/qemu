@@ -174,6 +174,9 @@ int cpu_get_pic_interrupt(CPUX86State *env)
     }
 
     intno = pic_read_irq(isa_pic);
+
+    apic_log_pic_intr(cpu->apic_state, intno);
+
     return intno;
 }
 

@@ -189,6 +189,8 @@ struct APICCommonState {
     DeviceState *vapic;
     hwaddr vapic_paddr; /* note: persistence via kvmvapic */
     bool legacy_instance_id;
+
+    FILE* log;
 };
 
 typedef struct VAPICState {
