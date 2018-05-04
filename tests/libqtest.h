@@ -17,11 +17,34 @@
 #ifndef LIBQTEST_H
 #define LIBQTEST_H
 
-#include "qapi/qmp/qdict.h"
-
 typedef struct QTestState QTestState;
 
 extern QTestState *global_qtest;
+
+/**
+ * qtest_startf:
+ * @fmt...: Format for creating other arguments to pass to QEMU, formatted
+ * like sprintf().
+ *
+ * Start QEMU and return the resulting #QTestState (but unlike qtest_start(),
+ * #global_qtest is left at NULL).
+ *
+ * Returns: #QTestState instance.
+ */
+QTestState *qtest_startf(const char *fmt, ...) GCC_FMT_ATTR(1, 2);
+
+/**
+ * qtest_vstartf:
+ * @fmt: Format for creating other arguments to pass to QEMU, formatted
+ * like vsprintf().
+ * @ap: Format arguments.
+ *
+ * Start QEMU and return the resulting #QTestState (but unlike qtest_start(),
+ * #global_qtest is left at NULL).
+ *
+ * Returns: #QTestState instance.
+ */
+QTestState *qtest_vstartf(const char *fmt, va_list ap) GCC_FMT_ATTR(1, 0);
 
 /**
  * qtest_init:
@@ -33,11 +56,14 @@ QTestState *qtest_init(const char *extra_args);
 
 /**
  * qtest_init_without_qmp_handshake:
- * @extra_args: other arguments to pass to QEMU.
+ * @use_oob: true to have the server advertise OOB support
+ * @extra_args: other arguments to pass to QEMU.  CAUTION: these
+ * arguments are subject to word splitting and shell evaluation.
  *
  * Returns: #QTestState instance.
  */
-QTestState *qtest_init_without_qmp_handshake(const char *extra_args);
+QTestState *qtest_init_without_qmp_handshake(bool use_oob,
+                                             const char *extra_args);
 
 /**
  * qtest_quit:

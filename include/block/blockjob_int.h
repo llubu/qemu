@@ -54,6 +54,16 @@ struct BlockJobDriver {
     void (*complete)(BlockJob *job, Error **errp);
 
     /**
+     * If the callback is not NULL, prepare will be invoked when all the jobs
+     * belonging to the same transaction complete; or upon this job's completion
+     * if it is not in a transaction.
+     *
+     * This callback will not be invoked if the job has already failed.
+     * If it fails, abort and then clean will be called.
+     */
+    int (*prepare)(BlockJob *job);
+
+    /**
      * If the callback is not NULL, it will be invoked when all the jobs
      * belonging to the same transaction complete; or upon this job's
      * completion if it is not in a transaction. Skipped if NULL.
@@ -114,10 +124,13 @@ struct BlockJobDriver {
  * block_job_create:
  * @job_id: The id of the newly-created job, or %NULL to have one
  * generated automatically.
- * @job_type: The class object for the newly-created job.
+ * @driver: The class object for the newly-created job.
+ * @txn: The transaction this job belongs to, if any. %NULL otherwise.
  * @bs: The block
  * @perm, @shared_perm: Permissions to request for @bs
  * @speed: The maximum speed, in bytes per second, or 0 for unlimited.
+ * @flags: Creation flags for the Block Job.
+ *         See @BlockJobCreateFlags
  * @cb: Completion function for the job.
  * @opaque: Opaque pointer value passed to @cb.
  * @errp: Error object.
@@ -132,20 +145,20 @@ struct BlockJobDriver {
  * called from a wrapper that is specific to the job type.
  */
 void *block_job_create(const char *job_id, const BlockJobDriver *driver,
-                       BlockDriverState *bs, uint64_t perm,
+                       BlockJobTxn *txn, BlockDriverState *bs, uint64_t perm,
                        uint64_t shared_perm, int64_t speed, int flags,
                        BlockCompletionFunc *cb, void *opaque, Error **errp);
 
 /**
  * block_job_sleep_ns:
  * @job: The job that calls the function.
- * @clock: The clock to sleep on.
  * @ns: How many nanoseconds to stop for.
  *
  * Put the job to sleep (assuming that it wasn't canceled) for @ns
- * nanoseconds.  Canceling the job will interrupt the wait immediately.
+ * %QEMU_CLOCK_REALTIME nanoseconds.  Canceling the job will immediately
+ * interrupt the wait.
  */
-void block_job_sleep_ns(BlockJob *job, QEMUClockType type, int64_t ns);
+void block_job_sleep_ns(BlockJob *job, int64_t ns);
 
 /**
  * block_job_yield:

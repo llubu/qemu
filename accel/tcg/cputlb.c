@@ -92,8 +92,18 @@ static void flush_all_helper(CPUState *src, run_on_cpu_func fn,
     }
 }
 
-/* statistics */
-int tlb_flush_count;
+size_t tlb_flush_count(void)
+{
+    CPUState *cpu;
+    size_t count = 0;
+
+    CPU_FOREACH(cpu) {
+        CPUArchState *env = cpu->env_ptr;
+
+        count += atomic_read(&env->tlb_flush_count);
+    }
+    return count;
+}
 
 /* This is OK because CPU architectures generally permit an
  * implementation to drop entries from the TLB at any time, so
@@ -112,7 +122,8 @@ static void tlb_flush_nocheck(CPUState *cpu)
     }
 
     assert_cpu_is_self(cpu);
-    tlb_debug("(count: %d)\n", tlb_flush_count++);
+    atomic_set(&env->tlb_flush_count, env->tlb_flush_count + 1);
+    tlb_debug("(count: %zu)\n", tlb_flush_count());
 
     tb_lock();
 
@@ -683,6 +694,9 @@ void tlb_set_page_with_attrs(CPUState *cpu, target_ulong vaddr,
         } else {
             tn.addr_write = address;
         }
+        if (prot & PAGE_WRITE_INV) {
+            tn.addr_write |= TLB_INVALID_MASK;
+        }
     }
 
     /* Pairs with flag setting in tlb_reset_dirty_range */
@@ -866,7 +880,7 @@ tb_page_addr_t get_page_addr_code(CPUArchState *env, target_ulong addr)
     if (unlikely(env->tlb_table[mmu_idx][index].addr_code !=
                  (addr & (TARGET_PAGE_MASK | TLB_INVALID_MASK)))) {
         if (!VICTIM_TLB_HIT(addr_read, addr)) {
-            tlb_fill(ENV_GET_CPU(env), addr, MMU_INST_FETCH, mmu_idx, 0);
+            tlb_fill(ENV_GET_CPU(env), addr, 0, MMU_INST_FETCH, mmu_idx, 0);
         }
     }
     iotlbentry = &env->iotlb[mmu_idx][index];
@@ -914,7 +928,7 @@ tb_page_addr_t get_page_addr_code(CPUArchState *env, target_ulong addr)
  * Otherwise the function will return, and there will be a valid
  * entry in the TLB for this access.
  */
-void probe_write(CPUArchState *env, target_ulong addr, int mmu_idx,
+void probe_write(CPUArchState *env, target_ulong addr, int size, int mmu_idx,
                  uintptr_t retaddr)
 {
     int index = (addr >> TARGET_PAGE_BITS) & (CPU_TLB_SIZE - 1);
@@ -924,7 +938,8 @@ void probe_write(CPUArchState *env, target_ulong addr, int mmu_idx,
         != (tlb_addr & (TARGET_PAGE_MASK | TLB_INVALID_MASK))) {
         /* TLB entry is for a different page */
         if (!VICTIM_TLB_HIT(addr_write, addr)) {
-            tlb_fill(ENV_GET_CPU(env), addr, MMU_DATA_STORE, mmu_idx, retaddr);
+            tlb_fill(ENV_GET_CPU(env), addr, size, MMU_DATA_STORE,
+                     mmu_idx, retaddr);
         }
     }
 }
@@ -932,7 +947,8 @@ void probe_write(CPUArchState *env, target_ulong addr, int mmu_idx,
 /* Probe for a read-modify-write atomic operation.  Do not allow unaligned
  * operations, or io operations to proceed.  Return the host address.  */
 static void *atomic_mmu_lookup(CPUArchState *env, target_ulong addr,
-                               TCGMemOpIdx oi, uintptr_t retaddr)
+                               TCGMemOpIdx oi, uintptr_t retaddr,
+                               NotDirtyInfo *ndi)
 {
     size_t mmu_idx = get_mmuidx(oi);
     size_t index = (addr >> TARGET_PAGE_BITS) & (CPU_TLB_SIZE - 1);
@@ -941,6 +957,7 @@ static void *atomic_mmu_lookup(CPUArchState *env, target_ulong addr,
     TCGMemOp mop = get_memop(oi);
     int a_bits = get_alignment_bits(mop);
     int s_bits = mop & MO_SIZE;
+    void *hostaddr;
 
     /* Adjust the given return address.  */
     retaddr -= GETPC_ADJ;
@@ -965,34 +982,40 @@ static void *atomic_mmu_lookup(CPUArchState *env, target_ulong addr,
     if ((addr & TARGET_PAGE_MASK)
         != (tlb_addr & (TARGET_PAGE_MASK | TLB_INVALID_MASK))) {
         if (!VICTIM_TLB_HIT(addr_write, addr)) {
-            tlb_fill(ENV_GET_CPU(env), addr, MMU_DATA_STORE, mmu_idx, retaddr);
+            tlb_fill(ENV_GET_CPU(env), addr, 1 << s_bits, MMU_DATA_STORE,
+                     mmu_idx, retaddr);
         }
-        tlb_addr = tlbe->addr_write;
-    }
-
-    /* Check notdirty */
-    if (unlikely(tlb_addr & TLB_NOTDIRTY)) {
-        tlb_set_dirty(ENV_GET_CPU(env), addr);
-        tlb_addr = tlb_addr & ~TLB_NOTDIRTY;
+        tlb_addr = tlbe->addr_write & ~TLB_INVALID_MASK;
     }
 
     /* Notice an IO access  */
-    if (unlikely(tlb_addr & ~TARGET_PAGE_MASK)) {
+    if (unlikely(tlb_addr & TLB_MMIO)) {
         /* There's really nothing that can be done to
            support this apart from stop-the-world.  */
         goto stop_the_world;
     }
 
     /* Let the guest notice RMW on a write-only page.  */
-    if (unlikely(tlbe->addr_read != tlb_addr)) {
-        tlb_fill(ENV_GET_CPU(env), addr, MMU_DATA_LOAD, mmu_idx, retaddr);
+    if (unlikely(tlbe->addr_read != (tlb_addr & ~TLB_NOTDIRTY))) {
+        tlb_fill(ENV_GET_CPU(env), addr, 1 << s_bits, MMU_DATA_LOAD,
+                 mmu_idx, retaddr);
         /* Since we don't support reads and writes to different addresses,
            and we do have the proper page loaded for write, this shouldn't
            ever return.  But just in case, handle via stop-the-world.  */
         goto stop_the_world;
     }
 
-    return (void *)((uintptr_t)addr + tlbe->addend);
+    hostaddr = (void *)((uintptr_t)addr + tlbe->addend);
+
+    ndi->active = false;
+    if (unlikely(tlb_addr & TLB_NOTDIRTY)) {
+        ndi->active = true;
+        memory_notdirty_write_prepare(ndi, ENV_GET_CPU(env), addr,
+                                      qemu_ram_addr_from_host_nofail(hostaddr),
+                                      1 << s_bits);
+    }
+
+    return hostaddr;
 
  stop_the_world:
     cpu_loop_exit_atomic(ENV_GET_CPU(env), retaddr);
@@ -1026,7 +1049,14 @@ static void *atomic_mmu_lookup(CPUArchState *env, target_ulong addr,
 #define EXTRA_ARGS     , TCGMemOpIdx oi, uintptr_t retaddr
 #define ATOMIC_NAME(X) \
     HELPER(glue(glue(glue(atomic_ ## X, SUFFIX), END), _mmu))
-#define ATOMIC_MMU_LOOKUP  atomic_mmu_lookup(env, addr, oi, retaddr)
+#define ATOMIC_MMU_DECLS NotDirtyInfo ndi
+#define ATOMIC_MMU_LOOKUP atomic_mmu_lookup(env, addr, oi, retaddr, &ndi)
+#define ATOMIC_MMU_CLEANUP                              \
+    do {                                                \
+        if (unlikely(ndi.active)) {                     \
+            memory_notdirty_write_complete(&ndi);       \
+        }                                               \
+    } while (0)
 
 #define DATA_SIZE 1
 #include "atomic_template.h"
@@ -1054,7 +1084,7 @@ static void *atomic_mmu_lookup(CPUArchState *env, target_ulong addr,
 #undef ATOMIC_MMU_LOOKUP
 #define EXTRA_ARGS         , TCGMemOpIdx oi
 #define ATOMIC_NAME(X)     HELPER(glue(glue(atomic_ ## X, SUFFIX), END))
-#define ATOMIC_MMU_LOOKUP  atomic_mmu_lookup(env, addr, oi, GETPC())
+#define ATOMIC_MMU_LOOKUP  atomic_mmu_lookup(env, addr, oi, GETPC(), &ndi)
 
 #define DATA_SIZE 1
 #include "atomic_template.h"

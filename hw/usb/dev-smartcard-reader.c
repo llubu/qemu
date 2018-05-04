@@ -270,11 +270,6 @@ typedef struct BulkIn {
     uint32_t pos;
 } BulkIn;
 
-enum {
-    MIGRATION_NONE,
-    MIGRATION_MIGRATED,
-};
-
 typedef struct CCIDBus {
     BusState qbus;
 } CCIDBus;
@@ -306,9 +301,6 @@ typedef struct USBCCIDState {
     CCID_ProtocolDataStructure abProtocolDataStructure;
     uint32_t ulProtocolDataStructureSize;
     uint32_t state_vmstate;
-    uint32_t migration_target_ip;
-    uint16_t migration_target_port;
-    uint8_t  migration_state;
     uint8_t  bmSlotICCState;
     uint8_t  powered;
     uint8_t  notify_slot_change;
@@ -337,8 +329,8 @@ static const uint8_t qemu_ccid_descriptor[] = {
                      */
         0x07,       /* u8  bVoltageSupport; 01h - 5.0v, 02h - 3.0, 03 - 1.8 */
 
-        0x00, 0x00, /* u32 dwProtocols; RRRR PPPP. RRRR = 0000h.*/
-        0x01, 0x00, /* PPPP: 0001h = Protocol T=0, 0002h = Protocol T=1 */
+        0x01, 0x00, /* u32 dwProtocols; RRRR PPPP. RRRR = 0000h.*/
+        0x00, 0x00, /* PPPP: 0001h = Protocol T=0, 0002h = Protocol T=1 */
                     /* u32 dwDefaultClock; in kHZ (0x0fa0 is 4 MHz) */
         0xa0, 0x0f, 0x00, 0x00,
                     /* u32 dwMaximumClock; */
@@ -506,26 +498,6 @@ static void ccid_card_apdu_from_guest(CCIDCardState *card,
     if (cc->apdu_from_guest) {
         cc->apdu_from_guest(card, apdu, len);
     }
-}
-
-static void ccid_card_exitfn(CCIDCardState *card)
-{
-    CCIDCardClass *cc = CCID_CARD_GET_CLASS(card);
-
-    if (cc->exitfn) {
-        cc->exitfn(card);
-    }
-
-}
-
-static int ccid_card_initfn(CCIDCardState *card)
-{
-    CCIDCardClass *cc = CCID_CARD_GET_CLASS(card);
-
-    if (cc->initfn) {
-        return cc->initfn(card);
-    }
-    return 0;
 }
 
 static bool ccid_has_pending_answers(USBCCIDState *s)
@@ -1243,9 +1215,6 @@ int ccid_card_ccid_attach(CCIDCardState *card)
     USBCCIDState *s = USB_CCID_DEV(dev);
 
     DPRINTF(s, 1, "CCID Attach\n");
-    if (s->migration_state == MIGRATION_MIGRATED) {
-        s->migration_state = MIGRATION_NONE;
-    }
     return 0;
 }
 
@@ -1292,41 +1261,52 @@ void ccid_card_card_inserted(CCIDCardState *card)
     ccid_on_slot_change(s, true);
 }
 
-static int ccid_card_exit(DeviceState *qdev)
+static void ccid_card_unrealize(DeviceState *qdev, Error **errp)
 {
     CCIDCardState *card = CCID_CARD(qdev);
+    CCIDCardClass *cc = CCID_CARD_GET_CLASS(card);
     USBDevice *dev = USB_DEVICE(qdev->parent_bus->parent);
     USBCCIDState *s = USB_CCID_DEV(dev);
+    Error *local_err = NULL;
 
     if (ccid_card_inserted(s)) {
         ccid_card_card_removed(card);
     }
-    ccid_card_exitfn(card);
+    if (cc->unrealize) {
+        cc->unrealize(card, &local_err);
+        if (local_err != NULL) {
+            error_propagate(errp, local_err);
+            return;
+        }
+    }
     s->card = NULL;
-    return 0;
 }
 
-static int ccid_card_init(DeviceState *qdev)
+static void ccid_card_realize(DeviceState *qdev, Error **errp)
 {
     CCIDCardState *card = CCID_CARD(qdev);
+    CCIDCardClass *cc = CCID_CARD_GET_CLASS(card);
     USBDevice *dev = USB_DEVICE(qdev->parent_bus->parent);
     USBCCIDState *s = USB_CCID_DEV(dev);
-    int ret = 0;
+    Error *local_err = NULL;
 
     if (card->slot != 0) {
-        warn_report("usb-ccid supports one slot, can't add %d",
-                    card->slot);
-        return -1;
+        error_setg(errp, "usb-ccid supports one slot, can't add %d",
+                   card->slot);
+        return;
     }
     if (s->card != NULL) {
-        warn_report("usb-ccid card already full, not adding");
-        return -1;
+        error_setg(errp, "usb-ccid card already full, not adding");
+        return;
     }
-    ret = ccid_card_initfn(card);
-    if (ret == 0) {
-        s->card = card;
+    if (cc->realize) {
+        cc->realize(card, &local_err);
+        if (local_err != NULL) {
+            error_propagate(errp, local_err);
+            return;
+        }
     }
-    return ret;
+    s->card = card;
 }
 
 static void ccid_realize(USBDevice *dev, Error **errp)
@@ -1341,9 +1321,6 @@ static void ccid_realize(USBDevice *dev, Error **errp)
     s->intr = usb_ep_get(dev, USB_TOKEN_IN, CCID_INT_IN_EP);
     s->bulk = usb_ep_get(dev, USB_TOKEN_IN, CCID_BULK_IN_EP);
     s->card = NULL;
-    s->migration_state = MIGRATION_NONE;
-    s->migration_target_ip = 0;
-    s->migration_target_port = 0;
     s->dev.speed = USB_SPEED_FULL;
     s->dev.speedmask = USB_SPEED_MASK_FULL;
     s->notify_slot_change = false;
@@ -1379,13 +1356,6 @@ static int ccid_pre_save(void *opaque)
     USBCCIDState *s = opaque;
 
     s->state_vmstate = s->dev.state;
-    if (s->dev.attached) {
-        /*
-         * Migrating an open device, ignore reconnection CHR_EVENT to avoid an
-         * erroneous detach.
-         */
-        s->migration_state = MIGRATION_MIGRATED;
-    }
 
     return 0;
 }
@@ -1452,7 +1422,7 @@ static VMStateDescription ccid_vmstate = {
         VMSTATE_STRUCT_ARRAY(pending_answers, USBCCIDState,
                         PENDING_ANSWERS_NUM, 1, answer_vmstate, Answer),
         VMSTATE_UINT32(pending_answers_num, USBCCIDState),
-        VMSTATE_UINT8(migration_state, USBCCIDState),
+        VMSTATE_UNUSED(1), /* was migration_state */
         VMSTATE_UINT32(state_vmstate, USBCCIDState),
         VMSTATE_END_OF_LIST()
     }
@@ -1498,8 +1468,8 @@ static void ccid_card_class_init(ObjectClass *klass, void *data)
 {
     DeviceClass *k = DEVICE_CLASS(klass);
     k->bus_type = TYPE_CCID_BUS;
-    k->init = ccid_card_init;
-    k->exit = ccid_card_exit;
+    k->realize = ccid_card_realize;
+    k->unrealize = ccid_card_unrealize;
     k->props = ccid_props;
 }
 

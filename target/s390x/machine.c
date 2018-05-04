@@ -180,7 +180,7 @@ const VMStateDescription vmstate_exval = {
 
 static bool gscb_needed(void *opaque)
 {
-    return kvm_s390_get_gs();
+    return s390_has_feat(S390_FEAT_GUARDED_STORAGE);
 }
 
 const VMStateDescription vmstate_gscb = {
@@ -192,6 +192,22 @@ const VMStateDescription vmstate_gscb = {
         VMSTATE_UINT64_ARRAY(env.gscb, S390CPU, 4),
         VMSTATE_END_OF_LIST()
         }
+};
+
+static bool bpbc_needed(void *opaque)
+{
+    return s390_has_feat(S390_FEAT_BPB);
+}
+
+const VMStateDescription vmstate_bpbc = {
+    .name = "cpu/bpbc",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = bpbc_needed,
+    .fields = (VMStateField[]) {
+        VMSTATE_BOOL(env.bpbc, S390CPU),
+        VMSTATE_END_OF_LIST()
+    }
 };
 
 const VMStateDescription vmstate_s390_cpu = {
@@ -228,6 +244,7 @@ const VMStateDescription vmstate_s390_cpu = {
         &vmstate_riccb,
         &vmstate_exval,
         &vmstate_gscb,
+        &vmstate_bpbc,
         NULL
     },
 };

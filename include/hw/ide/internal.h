@@ -12,7 +12,6 @@
 #include "sysemu/sysemu.h"
 #include "hw/block/block.h"
 #include "scsi/constants.h"
-#include "qapi/error.h"
 
 /* debug IDE devices */
 #define USE_DMA_CDROM
@@ -508,6 +507,14 @@ struct IDEDevice {
     char *serial;
     char *model;
     uint64_t wwn;
+    /*
+     * 0x0000        - rotation rate not reported
+     * 0x0001        - non-rotating medium (SSD)
+     * 0x0002-0x0400 - reserved
+     * 0x0401-0xffe  - rotations per minute
+     * 0xffff        - reserved
+     */
+    uint16_t rotation_rate;
 };
 
 /* These are used for the error_status field of IDEBus */

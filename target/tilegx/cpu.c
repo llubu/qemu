@@ -103,14 +103,8 @@ static void tilegx_cpu_initfn(Object *obj)
     CPUState *cs = CPU(obj);
     TileGXCPU *cpu = TILEGX_CPU(obj);
     CPUTLGState *env = &cpu->env;
-    static bool tcg_initialized;
 
     cs->env_ptr = env;
-
-    if (tcg_enabled() && !tcg_initialized) {
-        tcg_initialized = true;
-        tilegx_tcg_init();
-    }
 }
 
 static void tilegx_cpu_do_interrupt(CPUState *cs)
@@ -118,8 +112,8 @@ static void tilegx_cpu_do_interrupt(CPUState *cs)
     cs->exception_index = -1;
 }
 
-static int tilegx_cpu_handle_mmu_fault(CPUState *cs, vaddr address, int rw,
-                                       int mmu_idx)
+static int tilegx_cpu_handle_mmu_fault(CPUState *cs, vaddr address, int size,
+                                       int rw, int mmu_idx)
 {
     TileGXCPU *cpu = TILEGX_CPU(cs);
 
@@ -147,8 +141,8 @@ static void tilegx_cpu_class_init(ObjectClass *oc, void *data)
     CPUClass *cc = CPU_CLASS(oc);
     TileGXCPUClass *tcc = TILEGX_CPU_CLASS(oc);
 
-    tcc->parent_realize = dc->realize;
-    dc->realize = tilegx_cpu_realizefn;
+    device_class_set_parent_realize(dc, tilegx_cpu_realizefn,
+                                    &tcc->parent_realize);
 
     tcc->parent_reset = cc->reset;
     cc->reset = tilegx_cpu_reset;
@@ -161,6 +155,7 @@ static void tilegx_cpu_class_init(ObjectClass *oc, void *data)
     cc->set_pc = tilegx_cpu_set_pc;
     cc->handle_mmu_fault = tilegx_cpu_handle_mmu_fault;
     cc->gdb_num_core_regs = 0;
+    cc->tcg_initialize = tilegx_tcg_init;
 }
 
 static const TypeInfo tilegx_cpu_type_info = {

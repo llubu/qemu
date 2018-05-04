@@ -39,6 +39,8 @@
 #include <sys/ucontext.h>
 #endif
 
+__thread uintptr_t helper_retaddr;
+
 //#define DEBUG_SIGNAL
 
 /* exit the current TB from a signal handler. The host registers are
@@ -55,12 +57,34 @@ static void cpu_exit_tb_from_sighandler(CPUState *cpu, sigset_t *old_set)
    the effective address of the memory exception. 'is_write' is 1 if a
    write caused the exception and otherwise 0'. 'old_set' is the
    signal set which should be restored */
-static inline int handle_cpu_signal(uintptr_t pc, unsigned long address,
+static inline int handle_cpu_signal(uintptr_t pc, siginfo_t *info,
                                     int is_write, sigset_t *old_set)
 {
     CPUState *cpu = current_cpu;
     CPUClass *cc;
     int ret;
+    unsigned long address = (unsigned long)info->si_addr;
+
+    /* We must handle PC addresses from two different sources:
+     * a call return address and a signal frame address.
+     *
+     * Within cpu_restore_state_from_tb we assume the former and adjust
+     * the address by -GETPC_ADJ so that the address is within the call
+     * insn so that addr does not accidentally match the beginning of the
+     * next guest insn.
+     *
+     * However, when the PC comes from the signal frame, it points to
+     * the actual faulting host insn and not a call insn.  Subtracting
+     * GETPC_ADJ in that case may accidentally match the previous guest insn.
+     *
+     * So for the later case, adjust forward to compensate for what
+     * will be done later by cpu_restore_state_from_tb.
+     */
+    if (helper_retaddr) {
+        pc = helper_retaddr;
+    } else {
+        pc += GETPC_ADJ;
+    }
 
     /* For synchronous signals we expect to be coming from the vCPU
      * thread (so current_cpu should be valid) and either from running
@@ -80,25 +104,39 @@ static inline int handle_cpu_signal(uintptr_t pc, unsigned long address,
            pc, address, is_write, *(unsigned long *)old_set);
 #endif
     /* XXX: locking issue */
-    if (is_write && h2g_valid(address)) {
+    /* Note that it is important that we don't call page_unprotect() unless
+     * this is really a "write to nonwriteable page" fault, because
+     * page_unprotect() assumes that if it is called for an access to
+     * a page that's writeable this means we had two threads racing and
+     * another thread got there first and already made the page writeable;
+     * so we will retry the access. If we were to call page_unprotect()
+     * for some other kind of fault that should really be passed to the
+     * guest, we'd end up in an infinite loop of retrying the faulting
+     * access.
+     */
+    if (is_write && info->si_signo == SIGSEGV && info->si_code == SEGV_ACCERR &&
+        h2g_valid(address)) {
         switch (page_unprotect(h2g(address), pc)) {
         case 0:
             /* Fault not caused by a page marked unwritable to protect
-             * cached translations, must be the guest binary's problem
+             * cached translations, must be the guest binary's problem.
              */
             break;
         case 1:
             /* Fault caused by protection of cached translation; TBs
-             * invalidated, so resume execution
+             * invalidated, so resume execution.  Retain helper_retaddr
+             * for a possible second fault.
              */
             return 1;
         case 2:
             /* Fault caused by protection of cached translation, and the
              * currently executing TB was modified and must be exited
-             * immediately.
+             * immediately.  Clear helper_retaddr for next execution.
              */
+            helper_retaddr = 0;
             cpu_exit_tb_from_sighandler(cpu, old_set);
-            g_assert_not_reached();
+            /* NORETURN */
+
         default:
             g_assert_not_reached();
         }
@@ -111,18 +149,26 @@ static inline int handle_cpu_signal(uintptr_t pc, unsigned long address,
     cc = CPU_GET_CLASS(cpu);
     /* see if it is an MMU fault */
     g_assert(cc->handle_mmu_fault);
-    ret = cc->handle_mmu_fault(cpu, address, is_write, MMU_USER_IDX);
+    ret = cc->handle_mmu_fault(cpu, address, 0, is_write, MMU_USER_IDX);
+
+    if (ret == 0) {
+        /* The MMU fault was handled without causing real CPU fault.
+         *  Retain helper_retaddr for a possible second fault.
+         */
+        return 1;
+    }
+
+    /* All other paths lead to cpu_exit; clear helper_retaddr
+     * for next execution.
+     */
+    helper_retaddr = 0;
+
     if (ret < 0) {
         return 0; /* not an MMU fault */
     }
-    if (ret == 0) {
-        return 1; /* the MMU fault was handled without causing real CPU fault */
-    }
 
-    /* Now we have a real cpu fault.  Since this is the exact location of
-     * the exception, we must undo the adjustment done by cpu_restore_state
-     * for handling call return addresses.  */
-    cpu_restore_state(cpu, pc + GETPC_ADJ);
+    /* Now we have a real cpu fault.  */
+    cpu_restore_state(cpu, pc, true);
 
     sigprocmask(SIG_SETMASK, old_set, NULL);
     cpu_loop_exit(cpu);
@@ -181,9 +227,8 @@ int cpu_signal_handler(int host_signum, void *pinfo,
 #endif
     pc = EIP_sig(uc);
     trapno = TRAP_sig(uc);
-    return handle_cpu_signal(pc, (unsigned long)info->si_addr,
-                             trapno == 0xe ?
-                             (ERROR_sig(uc) >> 1) & 1 : 0,
+    return handle_cpu_signal(pc, info,
+                             trapno == 0xe ? (ERROR_sig(uc) >> 1) & 1 : 0,
                              &MASK_sig(uc));
 }
 
@@ -227,9 +272,8 @@ int cpu_signal_handler(int host_signum, void *pinfo,
 #endif
 
     pc = PC_sig(uc);
-    return handle_cpu_signal(pc, (unsigned long)info->si_addr,
-                             TRAP_sig(uc) == 0xe ?
-                             (ERROR_sig(uc) >> 1) & 1 : 0,
+    return handle_cpu_signal(pc, info,
+                             TRAP_sig(uc) == 0xe ? (ERROR_sig(uc) >> 1) & 1 : 0,
                              &MASK_sig(uc));
 }
 
@@ -307,8 +351,7 @@ int cpu_signal_handler(int host_signum, void *pinfo,
         is_write = 1;
     }
 #endif
-    return handle_cpu_signal(pc, (unsigned long)info->si_addr,
-                             is_write, &uc->uc_sigmask);
+    return handle_cpu_signal(pc, info, is_write, &uc->uc_sigmask);
 }
 
 #elif defined(__alpha__)
@@ -338,8 +381,7 @@ int cpu_signal_handler(int host_signum, void *pinfo,
         is_write = 1;
     }
 
-    return handle_cpu_signal(pc, (unsigned long)info->si_addr,
-                             is_write, &uc->uc_sigmask);
+    return handle_cpu_signal(pc, info, is_write, &uc->uc_sigmask);
 }
 #elif defined(__sparc__)
 
@@ -398,8 +440,7 @@ int cpu_signal_handler(int host_signum, void *pinfo,
             break;
         }
     }
-    return handle_cpu_signal(pc, (unsigned long)info->si_addr,
-                             is_write, sigmask);
+    return handle_cpu_signal(pc, info, is_write, sigmask);
 }
 
 #elif defined(__arm__)
@@ -432,9 +473,7 @@ int cpu_signal_handler(int host_signum, void *pinfo,
      * later processor; on v5 we will always report this as a read).
      */
     is_write = extract32(uc->uc_mcontext.error_code, 11, 1);
-    return handle_cpu_signal(pc, (unsigned long)info->si_addr,
-                             is_write,
-                             &uc->uc_sigmask);
+    return handle_cpu_signal(pc, info, is_write, &uc->uc_sigmask);
 }
 
 #elif defined(__aarch64__)
@@ -461,43 +500,7 @@ int cpu_signal_handler(int host_signum, void *pinfo, void *puc)
                 /* Ignore bits 23 & 24, controlling indexing.  */
                 || (insn & 0x3a400000) == 0x28000000); /* C3.3.7,14-16 */
 
-    return handle_cpu_signal(pc, (uintptr_t)info->si_addr,
-                             is_write, &uc->uc_sigmask);
-}
-
-#elif defined(__ia64)
-
-#ifndef __ISR_VALID
-  /* This ought to be in <bits/siginfo.h>... */
-# define __ISR_VALID    1
-#endif
-
-int cpu_signal_handler(int host_signum, void *pinfo, void *puc)
-{
-    siginfo_t *info = pinfo;
-    ucontext_t *uc = puc;
-    unsigned long ip;
-    int is_write = 0;
-
-    ip = uc->uc_mcontext.sc_ip;
-    switch (host_signum) {
-    case SIGILL:
-    case SIGFPE:
-    case SIGSEGV:
-    case SIGBUS:
-    case SIGTRAP:
-        if (info->si_code && (info->si_segvflags & __ISR_VALID)) {
-            /* ISR.W (write-access) is bit 33:  */
-            is_write = (info->si_isr >> 33) & 1;
-        }
-        break;
-
-    default:
-        break;
-    }
-    return handle_cpu_signal(ip, (unsigned long)info->si_addr,
-                             is_write,
-                             (sigset_t *)&uc->uc_sigmask);
+    return handle_cpu_signal(pc, info, is_write, &uc->uc_sigmask);
 }
 
 #elif defined(__s390__)
@@ -549,8 +552,7 @@ int cpu_signal_handler(int host_signum, void *pinfo,
         }
         break;
     }
-    return handle_cpu_signal(pc, (unsigned long)info->si_addr,
-                             is_write, &uc->uc_sigmask);
+    return handle_cpu_signal(pc, info, is_write, &uc->uc_sigmask);
 }
 
 #elif defined(__mips__)
@@ -565,8 +567,7 @@ int cpu_signal_handler(int host_signum, void *pinfo,
 
     /* XXX: compute is_write */
     is_write = 0;
-    return handle_cpu_signal(pc, (unsigned long)info->si_addr,
-                             is_write, &uc->uc_sigmask);
+    return handle_cpu_signal(pc, info, is_write, &uc->uc_sigmask);
 }
 
 #else
@@ -585,11 +586,14 @@ static void *atomic_mmu_lookup(CPUArchState *env, target_ulong addr,
     if (unlikely(addr & (size - 1))) {
         cpu_loop_exit_atomic(ENV_GET_CPU(env), retaddr);
     }
+    helper_retaddr = retaddr;
     return g2h(addr);
 }
 
 /* Macro to call the above, with local variables from the use context.  */
+#define ATOMIC_MMU_DECLS do {} while (0)
 #define ATOMIC_MMU_LOOKUP  atomic_mmu_lookup(env, addr, DATA_SIZE, GETPC())
+#define ATOMIC_MMU_CLEANUP do { helper_retaddr = 0; } while (0)
 
 #define ATOMIC_NAME(X)   HELPER(glue(glue(atomic_ ## X, SUFFIX), END))
 #define EXTRA_ARGS

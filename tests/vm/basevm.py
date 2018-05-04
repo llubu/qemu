@@ -107,10 +107,7 @@ class BaseVM(object):
         assert not isinstance(cmd, str)
         ssh_cmd += ["%s@127.0.0.1" % user] + list(cmd)
         logging.debug("ssh_cmd: %s", " ".join(ssh_cmd))
-        r = subprocess.call(ssh_cmd,
-                            stdin=sys.stdin if interactive else self._devnull,
-                            stdout=sys.stdout if interactive else self._stdout,
-                            stderr=sys.stderr if interactive else self._stderr)
+        r = subprocess.call(ssh_cmd)
         if check and r != 0:
             raise Exception("SSH command failed: %s" % cmd)
         return r
@@ -227,8 +224,8 @@ def main(vmcls):
         if not argv and not args.build_qemu and not args.build_image:
             print "Nothing to do?"
             return 1
-        if args.debug:
-            logging.getLogger().setLevel(logging.DEBUG)
+        logging.basicConfig(level=(logging.DEBUG if args.debug
+                                   else logging.WARN))
         vm = vmcls(debug=args.debug, vcpus=args.jobs)
         if args.build_image:
             if os.path.exists(args.image) and not args.force:

@@ -12,7 +12,6 @@
 
 #include "qemu/osdep.h"
 #include "qapi/error.h"
-#include "qemu-common.h"
 #include "cpu.h"
 #include "hw/boards.h"
 #include "exec/address-spaces.h"
@@ -24,16 +23,17 @@
 #include "virtio-ccw.h"
 #include "qemu/config-file.h"
 #include "qemu/error-report.h"
+#include "qemu/option.h"
 #include "s390-pci-bus.h"
 #include "hw/s390x/storage-keys.h"
 #include "hw/s390x/storage-attributes.h"
+#include "hw/s390x/event-facility.h"
 #include "hw/compat.h"
 #include "ipl.h"
 #include "hw/s390x/s390-virtio-ccw.h"
 #include "hw/s390x/css-bridge.h"
 #include "migration/register.h"
 #include "cpu_models.h"
-#include "qapi/qmp/qerror.h"
 #include "hw/nmi.h"
 
 S390CPU *s390_cpu_addr2state(uint16_t cpu_addr)
@@ -52,16 +52,31 @@ S390CPU *s390_cpu_addr2state(uint16_t cpu_addr)
     return S390_CPU(ms->possible_cpus->cpus[cpu_addr].cpu);
 }
 
+static S390CPU *s390x_new_cpu(const char *typename, uint32_t core_id,
+                              Error **errp)
+{
+    S390CPU *cpu = S390_CPU(object_new(typename));
+    Error *err = NULL;
+
+    object_property_set_int(OBJECT(cpu), core_id, "core-id", &err);
+    if (err != NULL) {
+        goto out;
+    }
+    object_property_set_bool(OBJECT(cpu), true, "realized", &err);
+
+out:
+    object_unref(OBJECT(cpu));
+    if (err) {
+        error_propagate(errp, err);
+        cpu = NULL;
+    }
+    return cpu;
+}
+
 static void s390_init_cpus(MachineState *machine)
 {
     MachineClass *mc = MACHINE_GET_CLASS(machine);
     int i;
-
-    if (tcg_enabled() && max_cpus > 1) {
-        error_report("Number of SMP CPUs requested (%d) exceeds max CPUs "
-                     "supported by TCG (1) on s390x", max_cpus);
-        exit(1);
-    }
 
     /* initialize possible_cpus */
     mc->possible_cpu_arch_ids(machine);
@@ -133,14 +148,38 @@ static void virtio_ccw_register_hcalls(void)
                                    virtio_ccw_hcall_early_printk);
 }
 
+/*
+ * KVM does only support memory slots up to KVM_MEM_MAX_NR_PAGES pages
+ * as the dirty bitmap must be managed by bitops that take an int as
+ * position indicator. If we have a guest beyond that we will split off
+ * new subregions. The split must happen on a segment boundary (1MB).
+ */
+#define KVM_MEM_MAX_NR_PAGES ((1ULL << 31) - 1)
+#define SEG_MSK (~0xfffffULL)
+#define KVM_SLOT_MAX_BYTES ((KVM_MEM_MAX_NR_PAGES * TARGET_PAGE_SIZE) & SEG_MSK)
 static void s390_memory_init(ram_addr_t mem_size)
 {
     MemoryRegion *sysmem = get_system_memory();
-    MemoryRegion *ram = g_new(MemoryRegion, 1);
+    ram_addr_t chunk, offset = 0;
+    unsigned int number = 0;
+    gchar *name;
 
     /* allocate RAM for core */
-    memory_region_allocate_system_memory(ram, NULL, "s390.ram", mem_size);
-    memory_region_add_subregion(sysmem, 0, ram);
+    name = g_strdup_printf("s390.ram");
+    while (mem_size) {
+        MemoryRegion *ram = g_new(MemoryRegion, 1);
+        uint64_t size = mem_size;
+
+        /* KVM does not allow memslots >= 8 TB */
+        chunk = MIN(size, KVM_SLOT_MAX_BYTES);
+        memory_region_allocate_system_memory(ram, NULL, name, chunk);
+        memory_region_add_subregion(sysmem, offset, ram);
+        mem_size -= chunk;
+        offset += chunk;
+        g_free(name);
+        name = g_strdup_printf("s390.ram.%u", ++number);
+    }
+    g_free(name);
 
     /* Initialize storage key device */
     s390_skeys_init();
@@ -207,6 +246,7 @@ static void s390_init_ipl_dev(const char *kernel_filename,
 {
     Object *new = object_new(TYPE_S390_IPL);
     DeviceState *dev = DEVICE(new);
+    char *netboot_fw_prop;
 
     if (kernel_filename) {
         qdev_prop_set_string(dev, "kernel", kernel_filename);
@@ -216,8 +256,12 @@ static void s390_init_ipl_dev(const char *kernel_filename,
     }
     qdev_prop_set_string(dev, "cmdline", kernel_cmdline);
     qdev_prop_set_string(dev, "firmware", firmware);
-    qdev_prop_set_string(dev, "netboot_fw", netboot_fw);
     qdev_prop_set_bit(dev, "enforce_bios", enforce_bios);
+    netboot_fw_prop = object_property_get_str(new, "netboot_fw", &error_abort);
+    if (!strlen(netboot_fw_prop)) {
+        qdev_prop_set_string(dev, "netboot_fw", netboot_fw);
+    }
+    g_free(netboot_fw_prop);
     object_property_add_child(qdev_get_machine(), TYPE_S390_IPL,
                               new, NULL);
     object_unref(new);
@@ -244,6 +288,15 @@ static void s390_create_virtio_net(BusState *bus, const char *name)
     }
 }
 
+static void s390_create_sclpconsole(const char *type, Chardev *chardev)
+{
+    DeviceState *dev;
+
+    dev = qdev_create(sclp_get_event_facility_bus(), type);
+    qdev_prop_set_chr(dev, "chardev", chardev);
+    qdev_init_nofail(dev);
+}
+
 static void ccw_init(MachineState *machine)
 {
     int ret;
@@ -257,6 +310,9 @@ static void ccw_init(MachineState *machine)
     s390_init_cpus(machine);
 
     s390_flic_init();
+
+    /* init the SIGP facility */
+    s390_init_sigp();
 
     /* get a BUS */
     css_bus = virtual_css_bus_init();
@@ -280,13 +336,17 @@ static void ccw_init(MachineState *machine)
     /*
      * Non mcss-e enabled guests only see the devices from the default
      * css, which is determined by the value of the squash_mcss property.
-     * Note: we must not squash non virtual devices to css 0xFE.
      */
     if (css_bus->squash_mcss) {
         ret = css_create_css_image(0, true);
     } else {
         ret = css_create_css_image(VIRTUAL_CSSID, true);
     }
+    if (qemu_opt_get(qemu_get_machine_opts(), "s390-squash-mcss")) {
+        warn_report("The machine property 's390-squash-mcss' is deprecated"
+                    " (obsoleted by lifting the cssid restrictions).");
+    }
+
     assert(ret == 0);
     if (css_migration_enabled()) {
         css_register_vmstate();
@@ -294,6 +354,14 @@ static void ccw_init(MachineState *machine)
 
     /* Create VirtIO network adapters */
     s390_create_virtio_net(BUS(css_bus), "virtio-net-ccw");
+
+    /* init consoles */
+    if (serial_hd(0)) {
+        s390_create_sclpconsole("sclpconsole", serial_hd(0));
+    }
+    if (serial_hd(1)) {
+        s390_create_sclpconsole("sclplmconsole", serial_hd(1));
+    }
 
     /* Register savevm handler for guest TOD clock */
     register_savevm_live(NULL, "todclock", 0, 1, &savevm_gtod, NULL);
@@ -323,7 +391,7 @@ static void s390_machine_reset(void)
 
     /* all cpus are stopped - configure and start the ipl cpu only */
     s390_ipl_prepare_cpu(ipl_cpu);
-    s390_cpu_set_state(CPU_STATE_OPERATING, ipl_cpu);
+    s390_cpu_set_state(S390_CPU_STATE_OPERATING, ipl_cpu);
 }
 
 static void s390_machine_device_plug(HotplugHandler *hotplug_dev,
@@ -343,12 +411,14 @@ static void s390_machine_device_unplug_request(HotplugHandler *hotplug_dev,
     }
 }
 
-static CpuInstanceProperties s390_cpu_index_to_props(MachineState *machine,
+static CpuInstanceProperties s390_cpu_index_to_props(MachineState *ms,
                                                      unsigned cpu_index)
 {
-    g_assert(machine->possible_cpus && cpu_index < machine->possible_cpus->len);
+    MachineClass *mc = MACHINE_GET_CLASS(ms);
+    const CPUArchIdList *possible_cpus = mc->possible_cpu_arch_ids(ms);
 
-    return machine->possible_cpus->cpus[cpu_index].props;
+    assert(cpu_index < possible_cpus->len);
+    return possible_cpus->cpus[cpu_index].props;
 }
 
 static const CPUArchIdList *s390_possible_cpu_arch_ids(MachineState *ms)
@@ -364,6 +434,7 @@ static const CPUArchIdList *s390_possible_cpu_arch_ids(MachineState *ms)
                                   sizeof(CPUArchId) * max_cpus);
     ms->possible_cpus->len = max_cpus;
     for (i = 0; i < ms->possible_cpus->len; i++) {
+        ms->possible_cpus->cpus[i].type = ms->cpu_type;
         ms->possible_cpus->cpus[i].vcpus_count = 1;
         ms->possible_cpus->cpus[i].arch_id = i;
         ms->possible_cpus->cpus[i].props.has_core_id = true;
@@ -397,9 +468,7 @@ static void s390_nmi(NMIState *n, int cpu_index, Error **errp)
 {
     CPUState *cs = qemu_get_cpu(cpu_index);
 
-    if (s390_cpu_restart(S390_CPU(cs))) {
-        error_setg(errp, QERR_UNSUPPORTED);
-    }
+    s390_cpu_restart(S390_CPU(cs));
 }
 
 static void ccw_machine_class_init(ObjectClass *oc, void *data)
@@ -412,17 +481,14 @@ static void ccw_machine_class_init(ObjectClass *oc, void *data)
     s390mc->ri_allowed = true;
     s390mc->cpu_model_allowed = true;
     s390mc->css_migration_enabled = true;
-    s390mc->gs_allowed = true;
     mc->init = ccw_init;
     mc->reset = s390_machine_reset;
     mc->hot_add_cpu = s390_hot_add_cpu;
     mc->block_default_type = IF_VIRTIO;
     mc->no_cdrom = 1;
     mc->no_floppy = 1;
-    mc->no_serial = 1;
     mc->no_parallel = 1;
     mc->no_sdcard = 1;
-    mc->use_sclp = 1;
     mc->max_cpus = S390_MAX_CPUS;
     mc->has_hotpluggable_cpus = true;
     mc->get_hotplug_handler = s390_get_hotplug_handler;
@@ -491,12 +557,6 @@ bool cpu_model_allowed(void)
 {
     /* for "none" machine this results in true */
     return get_machine_class()->cpu_model_allowed;
-}
-
-bool gs_allowed(void)
-{
-    /* for "none" machine this results in true */
-    return get_machine_class()->gs_allowed;
 }
 
 static char *machine_get_loadparm(Object *obj, Error **errp)
@@ -570,7 +630,7 @@ static inline void s390_machine_initfn(Object *obj)
     object_property_add_bool(obj, "s390-squash-mcss",
                              machine_get_squash_mcss,
                              machine_set_squash_mcss, NULL);
-    object_property_set_description(obj, "s390-squash-mcss",
+    object_property_set_description(obj, "s390-squash-mcss", "(deprecated) "
             "enable/disable squashing subchannels into the default css",
             NULL);
     object_property_set_bool(obj, false, "s390-squash-mcss", NULL);
@@ -625,6 +685,17 @@ bool css_migration_enabled(void)
         type_register_static(&ccw_machine_##suffix##_info);                   \
     }                                                                         \
     type_init(ccw_machine_register_##suffix)
+
+#define CCW_COMPAT_2_12 \
+        HW_COMPAT_2_12
+
+#define CCW_COMPAT_2_11 \
+        HW_COMPAT_2_11 \
+        {\
+            .driver   = TYPE_SCLP_EVENT_FACILITY,\
+            .property = "allow_all_mask_sizes",\
+            .value    = "off",\
+        },
 
 #define CCW_COMPAT_2_10 \
         HW_COMPAT_2_10
@@ -703,14 +774,42 @@ bool css_migration_enabled(void)
             .value    = "0",\
         },
 
+static void ccw_machine_2_13_instance_options(MachineState *machine)
+{
+}
+
+static void ccw_machine_2_13_class_options(MachineClass *mc)
+{
+}
+DEFINE_CCW_MACHINE(2_13, "2.13", true);
+
+static void ccw_machine_2_12_instance_options(MachineState *machine)
+{
+    ccw_machine_2_13_instance_options(machine);
+}
+
+static void ccw_machine_2_12_class_options(MachineClass *mc)
+{
+    ccw_machine_2_13_class_options(mc);
+    SET_MACHINE_COMPAT(mc, CCW_COMPAT_2_12);
+}
+DEFINE_CCW_MACHINE(2_12, "2.12", false);
+
 static void ccw_machine_2_11_instance_options(MachineState *machine)
 {
+    static const S390FeatInit qemu_cpu_feat = { S390_FEAT_LIST_QEMU_V2_11 };
+    ccw_machine_2_12_instance_options(machine);
+
+    /* before 2.12 we emulated the very first z900 */
+    s390_set_qemu_cpu_model(0x2064, 7, 1, qemu_cpu_feat);
 }
 
 static void ccw_machine_2_11_class_options(MachineClass *mc)
 {
+    ccw_machine_2_12_class_options(mc);
+    SET_MACHINE_COMPAT(mc, CCW_COMPAT_2_11);
 }
-DEFINE_CCW_MACHINE(2_11, "2.11", true);
+DEFINE_CCW_MACHINE(2_11, "2.11", false);
 
 static void ccw_machine_2_10_instance_options(MachineState *machine)
 {
@@ -738,7 +837,6 @@ static void ccw_machine_2_9_class_options(MachineClass *mc)
 {
     S390CcwMachineClass *s390mc = S390_MACHINE_CLASS(mc);
 
-    s390mc->gs_allowed = false;
     ccw_machine_2_10_class_options(mc);
     SET_MACHINE_COMPAT(mc, CCW_COMPAT_2_9);
     s390mc->css_migration_enabled = false;

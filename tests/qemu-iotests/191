@@ -45,7 +45,6 @@ trap "_cleanup; exit \$status" 0 1 2 3 15
 . ./common.qemu
 
 _supported_fmt qcow2
-_unsupported_imgopts compat=0.10
 _supported_proto file
 _supported_os Linux
 
@@ -56,7 +55,8 @@ echo === Preparing and starting VM ===
 echo
 
 TEST_IMG="${TEST_IMG}.base" _make_test_img $size
-TEST_IMG="${TEST_IMG}.mid" _make_test_img -b "${TEST_IMG}.base"
+IMGOPTS=$(_optstr_add "$IMGOPTS" "backing_fmt=$IMGFMT") \
+    TEST_IMG="${TEST_IMG}.mid" _make_test_img -b "${TEST_IMG}.base"
 _make_test_img -b "${TEST_IMG}.mid"
 TEST_IMG="${TEST_IMG}.ovl2" _make_test_img -b "${TEST_IMG}.mid"
 
@@ -91,7 +91,7 @@ echo === Check that both top and top2 point to base now ===
 echo
 
 _send_qemu_cmd $h "{ 'execute': 'query-named-block-nodes' }" "^}" |
-    _filter_generated_node_ids
+    _filter_generated_node_ids | _filter_actual_image_size | _filter_img_info
 
 _send_qemu_cmd $h "{ 'execute': 'quit' }" "^}"
 wait=1 _cleanup_qemu
@@ -139,7 +139,7 @@ echo === Check that both top and top2 point to base now ===
 echo
 
 _send_qemu_cmd $h "{ 'execute': 'query-named-block-nodes' }" "^}" |
-    _filter_generated_node_ids
+    _filter_generated_node_ids | _filter_actual_image_size | _filter_img_info
 
 _send_qemu_cmd $h "{ 'execute': 'quit' }" "^}"
 wait=1 _cleanup_qemu

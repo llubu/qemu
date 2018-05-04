@@ -242,7 +242,7 @@ _make_test_img()
     if [ $IMGPROTO = "nbd" ]; then
         # Pass a sufficiently high number to -e that should be enough for all
         # tests
-        eval "$QEMU_NBD -v -t -b 127.0.0.1 -p 10810 -f $IMGFMT -e 42  $TEST_IMG_FILE >/dev/null &"
+        eval "$QEMU_NBD -v -t -b 127.0.0.1 -p 10810 -f $IMGFMT -e 42 -x '' $TEST_IMG_FILE >/dev/null &"
         sleep 1 # FIXME: qemu-nbd needs to be listening before we continue
     fi
 
@@ -332,13 +332,13 @@ _img_info()
 
     discard=0
     regex_json_spec_start='^ *"format-specific": \{'
-    $QEMU_IMG info "$@" "$TEST_IMG" 2>&1 | \
+    $QEMU_IMG info $QEMU_IMG_EXTRA_ARGS "$@" "$TEST_IMG" 2>&1 | \
         sed -e "s#$IMGPROTO:$TEST_DIR#TEST_DIR#g" \
             -e "s#$TEST_DIR#TEST_DIR#g" \
             -e "s#$IMGFMT#IMGFMT#g" \
             -e "/^disk size:/ D" \
             -e "/actual-size/ D" | \
-        while IFS='' read line; do
+        while IFS='' read -r line; do
             if [[ $format_specific == 1 ]]; then
                 discard=0
             elif [[ $line == "Format specific information:" ]]; then
